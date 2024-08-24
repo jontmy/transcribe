@@ -2,12 +2,15 @@ use clap::Parser;
 use dotenvy::dotenv;
 use expanduser::expanduser;
 use itertools::Itertools;
+use reqwest::Client;
 use rs_openai::{
     audio::{AudioModel, CreateTranscriptionRequestBuilder, Language, ResponseFormat},
     shared::types::FileMeta,
     OpenAI,
 };
+use std::sync::Arc;
 use std::{env::var, fs::File, io::Write, process::exit};
+use tokio::sync::Mutex;
 use youtube_dl::YoutubeDl;
 
 #[derive(Parser, Debug)]
@@ -80,12 +83,9 @@ async fn main() {
 
     print!("Downloading audio track... ");
     std::io::stdout().flush().unwrap();
-    let audio = reqwest::get(audio_url)
+    let audio_bytes = download_file(&audio_url)
         .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+        .expect("Failed to download audio track");
     println!("done.");
 
     let openai = OpenAI::new(&OpenAI {
@@ -98,7 +98,7 @@ async fn main() {
         .response_format(ResponseFormat::Text)
         .temperature(0.0)
         .file(FileMeta {
-            buffer: audio.to_vec(),
+            buffer: audio_bytes.to_vec(),
             filename: "audio.m4a".to_string(),
         })
         .build()
@@ -118,4 +118,47 @@ async fn main() {
             .expect("Failed to write to output file");
     }
     println!("{}", res);
+}
+
+const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
+async fn download_file(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let response = client.get(url).send().await?;
+    let total_size = response.content_length().unwrap_or(0);
+
+    let data = Arc::new(Mutex::new(Vec::with_capacity(total_size as usize)));
+    let mut handles = vec![];
+
+    for i in (0..total_size).step_by(CHUNK_SIZE) {
+        let end = std::cmp::min(i + CHUNK_SIZE as u64 - 1, total_size - 1);
+        let range = format!("bytes={}-{}", i, end);
+
+        let client = client.clone();
+        let url = url.to_string();
+        let data = Arc::clone(&data);
+
+        let handle = tokio::spawn(async move {
+            let chunk = client
+                .get(&url)
+                .header("Range", range)
+                .send()
+                .await?
+                .bytes()
+                .await?;
+
+            let mut data = data.lock().await;
+            data.extend_from_slice(&chunk);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        handles.push(handle);
+    }
+
+    futures::future::try_join_all(handles).await?;
+
+    let result = Arc::try_unwrap(data)
+        .map_err(|_| "Failed to unwrap Arc")?
+        .into_inner();
+    Ok(result)
 }

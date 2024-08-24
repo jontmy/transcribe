@@ -1865,6 +1865,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "expanduser",
+ "futures",
  "itertools",
  "reqwest 0.12.7",
  "rs_openai",
